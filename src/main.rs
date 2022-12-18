@@ -1,9 +1,8 @@
 use std::time::Duration;
 
 use tokio::runtime::Builder;
-use tracing::{info, instrument};
+use tracing::info;
 
-#[instrument("main")]
 fn main() {
     tracing_setup::setup();
     info!("tracing setup");
@@ -106,12 +105,15 @@ mod ui_setup {
                 match event {
                     Event::WindowEvent { event, .. } => match event {
                         WindowEvent::CloseRequested => {
-                            quit.notify_waiters();
+                            flow.set_exit();
                         }
                         _ => {}
                     },
                     Event::MainEventsCleared => {
                         window.request_redraw();
+                    }
+                    Event::LoopDestroyed => {
+                        quit.notify_waiters();
                     }
                     _ => {}
                 }
