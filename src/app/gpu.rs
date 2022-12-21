@@ -1,12 +1,12 @@
-﻿use std::sync::Arc;
+﻿use std::{borrow::Cow, future::Future, sync::Arc};
 
 use anyhow::{Context, Error, Result};
 use parking_lot::Mutex;
-use tokio::runtime::{Builder, Runtime};
 use tracing::{instrument, warn};
 use wgpu::{
-    Adapter, Backends, CompositeAlphaMode, Device, DeviceDescriptor, Instance, PresentMode, Queue,
-    RequestAdapterOptions, Surface, SurfaceConfiguration, TextureFormat, TextureUsages,
+    Adapter, Backends, CompositeAlphaMode, Device, DeviceDescriptor, ErrorFilter, Instance,
+    PresentMode, Queue, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, Surface,
+    SurfaceConfiguration, TextureFormat, TextureUsages,
 };
 use winit::event_loop::EventLoopProxy;
 
@@ -14,7 +14,6 @@ use crate::app::{ui::UiMessage, Ui};
 
 pub struct Gpu {
     ui: Mutex<EventLoopProxy<UiMessage>>,
-    runtime: Runtime,
     instance: Instance,
     surface: Surface,
     surface_config: SurfaceConfiguration,
@@ -24,12 +23,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(ui: &Ui) -> Result<Arc<Self>> {
-        let runtime = Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("build tokio runtime")?;
-
+    pub async fn new(ui: &Ui) -> Result<Arc<Self>> {
         let instance = Instance::new(if cfg!(target_family = "wasm") {
             Backends::BROWSER_WEBGPU
         } else if cfg!(windows) {
@@ -43,21 +37,23 @@ impl Gpu {
         });
 
         let surface = unsafe { instance.create_surface(ui.get_window()) };
-        let adapter = runtime
-            .block_on(instance.request_adapter(&RequestAdapterOptions {
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
                 power_preference: Default::default(),
                 force_fallback_adapter: false,
                 compatible_surface: None,
-            }))
+            })
+            .await
             .ok_or_else(|| Error::msg("no adapter found"))?;
 
-        let (device, queue) = runtime
-            .block_on(adapter.request_device(
+        let (device, queue) = adapter
+            .request_device(
                 &DeviceDescriptor {
                     ..Default::default()
                 },
                 None,
-            ))
+            )
+            .await
             .context("request gpu device")?;
 
         let size = ui.get_window().inner_size();
@@ -74,7 +70,6 @@ impl Gpu {
 
         Ok(Arc::new(Self {
             ui: Mutex::new(ui.create_proxy()),
-            runtime,
             instance,
             surface,
             surface_config,
@@ -96,16 +91,45 @@ impl Gpu {
         surface.present();
     }
 
-    pub fn ignite(self: Arc<Self>) {
-        self.runtime.spawn(Arc::clone(&self).compute());
+    pub fn ignite(self: Arc<Self>) -> impl 'static + Future<Output = ()> + Send {
+        async move {
+            let result = self.compute().await;
+            self.send_message(UiMessage::ComputeComplete(Arc::new(result)));
+        }
     }
 
     #[instrument(skip_all)]
-    async fn compute(self: Arc<Self>) {}
+    async fn compute(self: &Arc<Self>) -> Result<()> {
+        let shader = self
+            .checked_device_op(async {
+                self.device.create_shader_module(ShaderModuleDescriptor {
+                    label: Some("compute.wgsl"),
+                    source: ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                        "../shaders/compute.wgsl"
+                    ))),
+                })
+            })
+            .await
+            .context("create shader")?;
+        
+        Ok(())
+    }
 
     fn send_message(&self, message: UiMessage) {
         if let Err(err) = self.ui.lock().send_event(message) {
             warn!("send ui message error {}", err);
         }
+    }
+
+    async fn checked_device_op<F, R>(&self, fut: F) -> Result<R>
+    where
+        F: Future<Output = R>,
+    {
+        self.device.push_error_scope(ErrorFilter::Validation);
+        let r = fut.await;
+        if let Some(err) = self.device.pop_error_scope().await {
+            return Err(Error::msg(format!("device error {}", err)));
+        }
+        Ok(r)
     }
 }

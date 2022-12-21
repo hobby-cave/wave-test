@@ -1,8 +1,8 @@
 ﻿use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result};
-use parking_lot::RwLock;
-use tracing::trace;
+use tokio::sync::RwLock;
+use tracing::{info, trace, warn};
 use winit::{
     dpi::LogicalSize,
     event::{Event, WindowEvent},
@@ -14,6 +14,7 @@ use crate::app::Gpu;
 
 #[derive(Debug, Clone)]
 pub enum UiMessage {
+    ComputeComplete(Arc<Result<()>>),
     ProgressUpdate,
 }
 
@@ -48,17 +49,17 @@ impl Ui {
         &self.window
     }
 
-    pub fn get_gpu(&mut self) -> Result<Arc<Gpu>> {
-        if let Some(gpu) = self.gpu.read().upgrade() {
+    pub async fn get_gpu(&mut self) -> Result<Arc<Gpu>> {
+        if let Some(gpu) = self.gpu.read().await.upgrade() {
             return Ok(gpu);
         }
 
-        let mut guard = self.gpu.write();
+        let mut guard = self.gpu.write().await;
         if let Some(gpu) = guard.upgrade() {
             return Ok(gpu);
         }
 
-        let gpu = Gpu::new(self).context("new gpu")?;
+        let gpu = Gpu::new(self).await.context("new gpu")?;
         *guard = Arc::downgrade(&gpu);
         Ok(gpu)
     }
@@ -81,7 +82,7 @@ impl Ui {
                     self.window.request_redraw();
                 }
                 Event::RedrawRequested(..) => {
-                    if let Some(gpu) = self.gpu.read().upgrade() {
+                    if let Some(gpu) = self.gpu.blocking_read().upgrade() {
                         gpu.draw();
                     }
                 }
@@ -89,6 +90,16 @@ impl Ui {
                     UiMessage::ProgressUpdate => {
                         self.window.request_redraw();
                     }
+                    UiMessage::ComputeComplete(result) => match result.as_ref() {
+                        Ok(_) => {
+                            info!("refresh ui by complete");
+                            self.window.request_redraw();
+                        }
+                        Err(err) => {
+                            warn!("quit ui by complete error {}", err);
+                            flow.set_exit();
+                        }
+                    },
                 },
                 _ => {}
             }

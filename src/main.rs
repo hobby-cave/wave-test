@@ -1,3 +1,4 @@
+use tokio::runtime::Builder;
 use tracing::{error, info};
 
 use crate::app::Ui;
@@ -19,7 +20,15 @@ fn main() {
     };
     info!("ui init");
 
-    let gpu = match ui.get_gpu() {
+    let runtime = match Builder::new_multi_thread().enable_all().build() {
+        Ok(v) => v,
+        Err(err) => {
+            error!("create tokio runtime error {:?}", err);
+            return;
+        }
+    };
+
+    let gpu = match runtime.block_on(ui.get_gpu()) {
         Ok(v) => v,
         Err(err) => {
             error!("create gpu error {:?}", err);
@@ -28,7 +37,7 @@ fn main() {
     };
     info!("gpu init");
 
-    gpu.ignite();
+    runtime.spawn(gpu.ignite());
     info!("gpu task begin");
 
     info!("enter ui event loop");
