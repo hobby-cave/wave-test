@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Error, Result};
 use parking_lot::Mutex;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 use wgpu::{
     Adapter, Backends, CompositeAlphaMode, Device, DeviceDescriptor, ErrorFilter, Instance,
     PresentMode, Queue, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, Surface,
@@ -46,6 +46,13 @@ impl Gpu {
             .await
             .ok_or_else(|| Error::msg("no adapter found"))?;
 
+        let info = adapter.get_info();
+        debug!("adapter {}", info.name);
+        debug!("  vendor {}", info.vendor);
+        debug!("  device type {:?}", info.device_type);
+        debug!("  backend {:?}", info.backend);
+        debug!("  driver info {:?}", info.driver_info);
+
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
@@ -55,6 +62,14 @@ impl Gpu {
             )
             .await
             .context("request gpu device")?;
+
+        let limits = device.limits();
+        debug!(
+            "  max worker size ({}, {}, {})",
+            limits.max_compute_workgroup_size_x,
+            limits.max_compute_workgroup_size_y,
+            limits.max_compute_workgroup_size_z
+        );
 
         let size = ui.get_window().inner_size();
         let surface_config = SurfaceConfiguration {
@@ -111,7 +126,7 @@ impl Gpu {
             })
             .await
             .context("create shader")?;
-        
+
         Ok(())
     }
 
