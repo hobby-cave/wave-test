@@ -1,15 +1,16 @@
-﻿use std::{borrow::Cow, num::NonZeroU32};
+﻿use std::borrow::Cow;
 
 use anyhow::{Context, Error, Result};
-use bytemuck::{bytes_of, Pod, Zeroable};
-use tracing::info;
+use bytemuck::{bytes_of, cast_slice, Pod, Zeroable};
+use image::GrayImage;
+use tokio::sync::oneshot;
+use tracing::{debug, error, info};
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
-    Backends, BindGroupDescriptor, BindGroupEntry, BufferUsages, CommandEncoderDescriptor,
-    ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor, ErrorFilter, Extent3d,
-    ImageCopyBuffer, ImageDataLayout, Instance, Maintain, RequestAdapterOptions,
-    ShaderModuleDescriptor, ShaderSource, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages,
+    Backends, BindGroupDescriptor, BindGroupEntry, Buffer, BufferDescriptor, BufferUsages,
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, Device,
+    DeviceDescriptor, ErrorFilter, Instance, Maintain, MapMode, Queue, RequestAdapterOptions,
+    ShaderModuleDescriptor, ShaderSource,
 };
 
 macro_rules! checked_device_op {
@@ -93,6 +94,19 @@ pub async fn run() -> Result<()> {
         limits.max_compute_workgroup_size_y,
         limits.max_compute_workgroup_size_z
     );
+
+    let output_buf = compute(&device, &queue).await?;
+    info!("compute done, start extraction.");
+
+    let image = extract_buf(&device, &queue, output_buf).await?;
+    info!("extraction done, save to file.");
+
+    image.save("output.png").context("save image")?;
+
+    Ok(())
+}
+
+async fn compute(device: &Device, queue: &Queue) -> Result<Buffer> {
     let shader = checked_device_op!("create shader", device, {
         device.create_shader_module(ShaderModuleDescriptor {
             label: Some("compute.wgsl"),
@@ -126,9 +140,8 @@ pub async fn run() -> Result<()> {
             usage: BufferUsages::UNIFORM,
         })
     });
-    let buf_size = WIDTH as u64 * HEIGHT as u64 * 16; // rgba 4 * f32 4 = 16
     let output_buf = checked_device_op!("create output buf", device, {
-        let content = vec![0; buf_size as usize];
+        let content = vec![0; WIDTH as usize * HEIGHT as usize * 4];
         device.create_buffer_init(&BufferInitDescriptor {
             label: Some("compute:bind:output:storage"),
             contents: &content,
@@ -168,42 +181,6 @@ pub async fn run() -> Result<()> {
     pass.dispatch_workgroups(WIDTH, HEIGHT, 1);
     drop(pass);
 
-    // create texture
-    let texture = checked_device_op!("create output texture", device, {
-        device.create_texture(&TextureDescriptor {
-            label: Some("compute:output:texture"),
-            size: Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::COPY_SRC | TextureUsages::COPY_DST,
-        })
-    });
-
-    checked_device_op!("write output texture", device, {
-        encoder.copy_buffer_to_texture(
-            ImageCopyBuffer {
-                buffer: &output_buf,
-                layout: ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: NonZeroU32::new(WIDTH * 16),
-                    rows_per_image: NonZeroU32::new(HEIGHT),
-                },
-            },
-            texture.as_image_copy(),
-            Extent3d {
-                width: WIDTH,
-                height: HEIGHT,
-                depth_or_array_layers: 1,
-            },
-        );
-    });
-
     let index = checked_device_op!("submit compute", device, {
         queue.submit([encoder.finish()])
     });
@@ -211,5 +188,61 @@ pub async fn run() -> Result<()> {
         device.poll(Maintain::WaitForSubmissionIndex(index));
     });
 
-    Ok(())
+    Ok(output_buf)
+}
+
+async fn extract_buf(device: &Device, queue: &Queue, buf: Buffer) -> Result<GrayImage> {
+    debug_assert_eq!(buf.size(), WIDTH as u64 * HEIGHT as u64 * 4);
+
+    let mut encoder = checked_device_op!("create encoder", device, {
+        device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("extract:encoder"),
+        })
+    });
+
+    let stage = checked_device_op!("create stage buffer", device, {
+        device.create_buffer(&BufferDescriptor {
+            label: Some("extract:stage"),
+            size: buf.size(),
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    });
+    checked_device_op!("copy buffer", device, {
+        encoder.copy_buffer_to_buffer(&buf, 0, &stage, 0, buf.size())
+    });
+
+    let index = checked_device_op!("submit extraction", device, {
+        queue.submit([encoder.finish()])
+    });
+    checked_device_op!("wait extraction", device, {
+        device.poll(Maintain::WaitForSubmissionIndex(index));
+    });
+    info!("extract copy done, read stage");
+
+    let data = {
+        let slice = stage.slice(..);
+        let (tx, rx) = oneshot::channel();
+        slice.map_async(MapMode::Read, move |r| {
+            debug!("stage mapped result {:?}", r);
+            if let Err(err) = tx.send(r) {
+                error!("can't dispatch map result {:?}", err);
+            }
+        });
+        device.poll(Maintain::Wait);
+        rx.await.context("wait map stage")?.context("map stage")?;
+        let data = slice.get_mapped_range().to_vec();
+        stage.unmap();
+        data
+    };
+
+    let data = cast_slice::<_, f32>(&data)
+        .iter()
+        .copied()
+        .map(|g| (255.0 * g) as u8)
+        .collect::<Vec<_>>();
+    debug!("image top pixel: {}", data[0]);
+
+    debug!("create GaryImage");
+    GrayImage::from_vec(WIDTH, HEIGHT, data).context("create image")
 }

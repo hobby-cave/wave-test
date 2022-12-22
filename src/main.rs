@@ -1,3 +1,5 @@
+extern crate core;
+
 use tracing::{error, info, subscriber::set_global_default, Level};
 use tracing_subscriber::fmt;
 
