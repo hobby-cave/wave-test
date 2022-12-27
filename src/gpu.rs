@@ -241,7 +241,6 @@ async fn extract_buf(device: &Device, queue: &Queue, buf: Buffer) -> Result<Gray
         .copied()
         .map(|g| (255.0 * g) as u8)
         .collect::<Vec<_>>();
-    debug!("image top pixel: {}", data[0]);
 
     debug!("create GaryImage");
     GrayImage::from_vec(WIDTH, HEIGHT, data).context("create image")
